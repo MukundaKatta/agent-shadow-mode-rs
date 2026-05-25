@@ -2,20 +2,12 @@
 name = "agent-shadow-mode"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
-description = "Toggle shadow mode for agent tool calls: record what would have happened without running real side-effecting code."
-authors = ["Mukunda Rao Katta <mukunda.vjcs6@gmail.com>"]
-license = "MIT OR Apache-2.0"
+description = "Record-not-execute shadow mode wrapper for AI agent tools"
+license = "MIT"
 repository = "https://github.com/MukundaKatta/agent-shadow-mode-rs"
-homepage = "https://github.com/MukundaKatta/agent-shadow-mode-rs"
-documentation = "https://docs.rs/agent-shadow-mode"
-readme = "README.md"
-keywords = ["llm", "agents", "shadow", "dry-run", "testing"]
-categories = ["api-bindings"]
-exclude = [".github/*", "target/*", "*.log"]
+keywords = ["agent", "shadow", "testing", "audit", "llm"]
+categories = ["development-tools::testing"]
+exclude = ["target/*", ".github/*", "*.log"]
 
 [dependencies]
-serde_json = "1"
-
-[dev-dependencies]
 serde_json = "1"
