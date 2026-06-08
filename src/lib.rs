@@ -16,7 +16,7 @@ assert_eq!(agent.entries().len(), 1);
 ```
 */
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,6 +37,22 @@ pub struct AuditEntry {
     /// Whether the call was shadowed (not executed).
     pub was_shadow: bool,
     pub timestamp: f64,
+}
+
+impl AuditEntry {
+    /// Convert this entry into a JSON object suitable for logging or export.
+    ///
+    /// The `result` field is `null` when the call was shadowed (or the
+    /// underlying function returned no value).
+    pub fn to_value(&self) -> Value {
+        json!({
+            "name": self.name,
+            "args": self.args,
+            "result": self.result.clone().unwrap_or(Value::Null),
+            "was_shadow": self.was_shadow,
+            "timestamp": self.timestamp,
+        })
+    }
 }
 
 /// An agent wrapper that records tool calls and optionally suppresses execution.
@@ -99,12 +115,56 @@ impl ShadowAgent {
 
     /// Count entries matching `name`.
     pub fn count(&self, name: &str) -> usize {
-        self.log.lock().unwrap().iter().filter(|e| e.name == name).count()
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.name == name)
+            .count()
     }
 
     /// True if any shadowed calls exist in the log.
     pub fn has_shadowed(&self) -> bool {
         self.log.lock().unwrap().iter().any(|e| e.was_shadow)
+    }
+
+    /// Serialize the audit log as JSON Lines (one JSON object per line).
+    ///
+    /// Each line is a compact JSON object with the fields `name`, `args`,
+    /// `result`, `was_shadow` and `timestamp`. An empty log yields an empty
+    /// string. The returned string does not have a trailing newline.
+    ///
+    /// ```
+    /// use agent_shadow_mode::ShadowAgent;
+    /// use serde_json::json;
+    ///
+    /// let agent = ShadowAgent::new(true);
+    /// agent.execute("search", &json!({"q": "x"}), || json!(null)).unwrap();
+    /// let jsonl = agent.to_jsonl();
+    /// assert!(jsonl.contains("\"name\":\"search\""));
+    /// assert!(jsonl.contains("\"was_shadow\":true"));
+    /// ```
+    pub fn to_jsonl(&self) -> String {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.to_value().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Write the audit log to `path` as JSON Lines.
+    ///
+    /// The file is created (or truncated) and a trailing newline is written
+    /// after the last entry when the log is non-empty, so the file is valid
+    /// JSONL that can be appended to or read line by line.
+    pub fn write_jsonl<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        let mut data = self.to_jsonl();
+        if !data.is_empty() {
+            data.push('\n');
+        }
+        std::fs::write(path, data)
     }
 }
 
@@ -126,10 +186,12 @@ mod tests {
     fn shadow_mode_does_not_call_fn() {
         let agent = ShadowAgent::new(true);
         let mut called = false;
-        let r = agent.execute("tool", &json!({}), || {
-            called = true;
-            json!("result")
-        }).unwrap();
+        let r = agent
+            .execute("tool", &json!({}), || {
+                called = true;
+                json!("result")
+            })
+            .unwrap();
         assert!(!called);
         assert!(r.is_none());
     }
@@ -137,14 +199,18 @@ mod tests {
     #[test]
     fn non_shadow_calls_fn() {
         let agent = ShadowAgent::new(false);
-        let r = agent.execute("tool", &json!({}), || json!("output")).unwrap();
+        let r = agent
+            .execute("tool", &json!({}), || json!("output"))
+            .unwrap();
         assert_eq!(r, Some(json!("output")));
     }
 
     #[test]
     fn shadow_entry_logged() {
         let agent = ShadowAgent::new(true);
-        agent.execute("search", &json!({"q": "x"}), || json!(null)).unwrap();
+        agent
+            .execute("search", &json!({"q": "x"}), || json!(null))
+            .unwrap();
         let entries = agent.entries();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].was_shadow);
@@ -156,7 +222,9 @@ mod tests {
     #[test]
     fn non_shadow_entry_logged_with_result() {
         let agent = ShadowAgent::new(false);
-        agent.execute("get", &json!({"id": 1}), || json!("data")).unwrap();
+        agent
+            .execute("get", &json!({"id": 1}), || json!("data"))
+            .unwrap();
         let entries = agent.entries();
         assert!(!entries[0].was_shadow);
         assert_eq!(entries[0].result, Some(json!("data")));
@@ -247,5 +315,78 @@ mod tests {
     fn empty_log_has_no_shadowed() {
         let agent = ShadowAgent::new(true);
         assert!(!agent.has_shadowed());
+    }
+
+    #[test]
+    fn to_jsonl_empty_is_empty_string() {
+        let agent = ShadowAgent::new(true);
+        assert_eq!(agent.to_jsonl(), "");
+    }
+
+    #[test]
+    fn to_jsonl_one_line_per_entry() {
+        let agent = ShadowAgent::new(false);
+        agent.execute("a", &json!({}), || json!(1)).unwrap();
+        agent.execute("b", &json!({}), || json!(2)).unwrap();
+        let jsonl = agent.to_jsonl();
+        assert_eq!(jsonl.lines().count(), 2);
+    }
+
+    #[test]
+    fn to_jsonl_lines_are_valid_json() {
+        let agent = ShadowAgent::new(true);
+        agent
+            .execute("search", &json!({"q": "x"}), || json!(null))
+            .unwrap();
+        let line = agent.to_jsonl();
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["name"], json!("search"));
+        assert_eq!(parsed["args"], json!({"q": "x"}));
+        assert_eq!(parsed["was_shadow"], json!(true));
+        assert_eq!(parsed["result"], Value::Null);
+    }
+
+    #[test]
+    fn to_value_uses_null_for_missing_result() {
+        let entry = AuditEntry {
+            name: "t".into(),
+            args: json!({}),
+            result: None,
+            was_shadow: true,
+            timestamp: 1.0,
+        };
+        assert_eq!(entry.to_value()["result"], Value::Null);
+    }
+
+    #[test]
+    fn write_jsonl_round_trips() {
+        let agent = ShadowAgent::new(false);
+        agent.execute("a", &json!({"k": 1}), || json!("r")).unwrap();
+        agent.execute("b", &json!({"k": 2}), || json!("s")).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("shadow-test-{}.jsonl", now_f64() as u128));
+        agent.write_jsonl(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(contents.ends_with('\n'));
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["name"], json!("a"));
+        assert_eq!(first["result"], json!("r"));
+    }
+
+    #[test]
+    fn write_jsonl_empty_log_writes_empty_file() {
+        let agent = ShadowAgent::new(true);
+        let mut path = std::env::temp_dir();
+        path.push(format!("shadow-empty-{}.jsonl", now_f64() as u128));
+        agent.write_jsonl(&path).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(contents, "");
     }
 }
